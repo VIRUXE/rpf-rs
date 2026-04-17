@@ -4,7 +4,7 @@ version = "0.1.0"
 edition = "2021"
 description = "RAGE Package File (RPF) archive parser and decryptor for GTA V and related titles"
 license = "MIT"
-repository = "https://github.com/VIRUXE/rpf-cli"
+repository = "https://github.com/VIRUXE/rage-rpf"
 keywords = ["gta", "rage", "rpf", "gta5", "fivem"]
 categories = ["parsing", "game-development"]
 
