@@ -3,6 +3,13 @@ mod writer_tests {
     use crate::archive::{RpfArchive, RpfEncryption, RpfVersion};
     use crate::writer::RpfBuilder;
 
+    // Flat files only (no subdirs) — IMG1/2 are flat formats
+    const FLAT_FILES: &[(&str, &[u8])] = &[
+        ("hello.txt",  b"Hello, world!"),
+        ("data.bin",   &[0xDE, 0xAD, 0xBE, 0xEF]),
+        ("deep.bin",   b"deep file content here"),
+    ];
+
     const FILES: &[(&str, &[u8])] = &[
         ("hello.txt",              b"Hello, world!"),
         ("subdir/data.bin",        &[0xDE, 0xAD, 0xBE, 0xEF]),
@@ -116,5 +123,52 @@ mod writer_tests {
         let bytes = builder.build(None).expect("build failed");
         let archive = RpfArchive::parse(&bytes, "empty.rpf", None).expect("parse failed");
         assert_eq!(archive.entries.len(), 1); // root dir only
+    }
+
+    #[test]
+    fn roundtrip_img2() {
+        let mut builder = RpfBuilder::for_version(RpfVersion::Img2, RpfEncryption::None);
+        for (path, data) in FLAT_FILES {
+            builder.add_file(path, data.to_vec());
+        }
+        let bytes = builder.build(None).expect("build failed");
+        let archive = RpfArchive::parse(&bytes, "test.img", None).expect("parse failed");
+
+        assert_eq!(archive.entries.iter().filter(|e| e.is_file()).count(), FLAT_FILES.len());
+        let names: Vec<&str> = archive.entries.iter().map(|e| e.name.as_str()).collect();
+        for (fname, _) in FLAT_FILES {
+            assert!(names.contains(fname), "img2: missing {fname}");
+        }
+        for (fname, expected) in FLAT_FILES {
+            let entry = archive.entries.iter().find(|e| e.name.as_str() == *fname).unwrap();
+            let extracted = archive.extract_entry(&bytes, entry, None)
+                .expect(&format!("img2: extract {fname} failed"));
+            // Extraction returns sector-padded data; check prefix matches
+            assert!(extracted.starts_with(expected),
+                "img2: content mismatch for {fname}");
+        }
+    }
+
+    #[test]
+    fn roundtrip_img1() {
+        let mut builder = RpfBuilder::for_version(RpfVersion::Img1, RpfEncryption::None);
+        for (path, data) in FLAT_FILES {
+            builder.add_file(path, data.to_vec());
+        }
+        let (dir_data, img_data) = builder.build_img1_pair().expect("build_img1_pair failed");
+        let archive = RpfArchive::parse_img1(&dir_data, "test.img").expect("parse_img1 failed");
+
+        assert_eq!(archive.entries.len(), FLAT_FILES.len());
+        let names: Vec<&str> = archive.entries.iter().map(|e| e.name.as_str()).collect();
+        for (fname, _) in FLAT_FILES {
+            assert!(names.contains(fname), "img1: missing {fname}");
+        }
+        for (fname, expected) in FLAT_FILES {
+            let entry = archive.entries.iter().find(|e| e.name.as_str() == *fname).unwrap();
+            let extracted = archive.extract_entry(&img_data, entry, None)
+                .expect(&format!("img1: extract {fname} failed"));
+            assert!(extracted.starts_with(expected),
+                "img1: content mismatch for {fname}");
+        }
     }
 }

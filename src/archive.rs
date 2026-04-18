@@ -12,7 +12,8 @@ pub const RPF7_MAGIC: u32 = 0x52504637; // GTA V
 pub const RPF8_MAGIC: u32 = 0x52504638; // Red Dead Redemption 2 (PC/y platform)
 pub const RSC7_MAGIC: u32 = 0x37435352;
 pub const RSC8_MAGIC: u32 = 0x38435352;
-pub const IMG3_MAGIC: u32 = 0xA94E2A52; // GTA SA / GTA IV (IMG v3)
+pub const IMG2_MAGIC: u32 = 0x32524556; // GTA SA (IMG v2) — "VER2"
+pub const IMG3_MAGIC: u32 = 0xA94E2A52; // RAGE IMG v3 (modding/IV-era)
 
 // ─── Version ─────────────────────────────────────────────────────────────────
 
@@ -25,7 +26,9 @@ pub enum RpfVersion {
     V6,   // Red Dead Redemption — big-endian 20-byte entries, offsets * 8
     V7,   // GTA V / FiveM — AES or NG encryption, 512-byte block offsets
     V8,   // Red Dead Redemption 2 — TFIT cipher, 24-byte entries, hash names
-    Img3, // GTA SA / GTA IV IMG v3 — flat archive, offsets * 2048
+    Img1, // GTA III / Vice City — paired .dir+.img, no magic, 32-byte entries
+    Img2, // GTA San Andreas — single .img with "VER2" magic
+    Img3, // RAGE IMG v3 (modding/IV-era) — 0xA94E2A52 magic
 }
 
 // ─── Encryption ──────────────────────────────────────────────────────────────
@@ -123,6 +126,13 @@ impl RpfArchive {
         Self::parse_at(data, 0, name, keys)
     }
 
+    /// Parse an IMG v1 (GTA III / Vice City) archive from its `.dir` file.
+    /// Pass the `.img` file data when calling `extract_entry` or `walk_files`.
+    pub fn parse_img1(dir_data: &[u8], name: &str) -> Result<Self> {
+        let entries = parse_img1_entries(dir_data)?;
+        Ok(Self { name: name.to_string(), start_offset: 0, encryption: RpfEncryption::None, entries, version: RpfVersion::Img1 })
+    }
+
     pub fn parse_at(data: &[u8], offset: usize, name: &str, keys: Option<&GtaKeys>) -> Result<Self> {
         let d = data.get(offset..).context("offset out of bounds")?;
         if d.len() < 12 { bail!("data too short"); }
@@ -136,6 +146,7 @@ impl RpfArchive {
             RPF6_MAGIC => RpfVersion::V6,
             RPF7_MAGIC => RpfVersion::V7,
             RPF8_MAGIC => RpfVersion::V8,
+            IMG2_MAGIC => RpfVersion::Img2,
             IMG3_MAGIC => RpfVersion::Img3,
             _ => bail!("unknown archive magic: {:#010x}", magic),
         };
@@ -145,6 +156,7 @@ impl RpfArchive {
             RpfVersion::V0   => parse_rpf0_toc(d)?,
             RpfVersion::V6   => parse_rpf6_toc(d)?,
             RpfVersion::V8   => parse_rpf8_toc(d)?,
+            RpfVersion::Img2 => parse_img2_toc(d)?,
             RpfVersion::Img3 => parse_img3_toc(d)?,
             _                => parse_rpf2_toc(d, version)?,
         };
@@ -454,6 +466,17 @@ impl RpfFile {
             .unwrap_or_else(|| path.to_str().unwrap_or(""));
 
         let archive = RpfArchive::parse(&data, name, keys)?;
+        Ok(Self { archive, data })
+    }
+
+    /// Open an IMG v1 (GTA III / Vice City) archive from its paired `.img` and `.dir` paths.
+    pub fn open_img1(img_path: &Path, dir_path: &Path) -> Result<Self> {
+        let data = fs::read(img_path)
+            .with_context(|| format!("cannot read {}", img_path.display()))?;
+        let dir_data = fs::read(dir_path)
+            .with_context(|| format!("cannot read {}", dir_path.display()))?;
+        let name = img_path.file_name().and_then(|n| n.to_str()).unwrap_or("");
+        let archive = RpfArchive::parse_img1(&dir_data, name)?;
         Ok(Self { archive, data })
     }
 
@@ -953,6 +976,73 @@ fn parse_rpf8_entries(entries_data: &[u8], count: usize) -> Result<Vec<RpfEntry>
     Ok(entries)
 }
 
+// ─── IMG1 TOC ────────────────────────────────────────────────────────────────
+
+fn parse_img1_entries(dir_data: &[u8]) -> Result<Vec<RpfEntry>> {
+    if dir_data.len() % 32 != 0 && dir_data.len() < 32 {
+        bail!("IMG1 dir data too short or misaligned");
+    }
+    let count = dir_data.len() / 32;
+    let mut entries = Vec::with_capacity(count);
+    for i in 0..count {
+        let off = i * 32;
+        if off + 32 > dir_data.len() { break; }
+        let chunk = &dir_data[off..off + 32];
+        let sector_offset = u32::from_le_bytes(chunk[0..4].try_into().unwrap());
+        let sector_size   = u32::from_le_bytes(chunk[4..8].try_into().unwrap());
+        let name = read_fixed_cstring(&chunk[8..32]);
+        let name_lower = name.to_lowercase();
+        entries.push(RpfEntry {
+            name,
+            name_lower,
+            kind: RpfEntryKind::BinaryFile {
+                file_offset      : sector_offset * 2048,
+                file_size        : 0,
+                uncompressed_size: sector_size * 2048,
+                is_encrypted     : false,
+            },
+        });
+    }
+    Ok(entries)
+}
+
+// ─── IMG2 TOC ────────────────────────────────────────────────────────────────
+
+fn parse_img2_toc(d: &[u8]) -> Result<(Vec<RpfEntry>, RpfEncryption)> {
+    if d.len() < 8 { bail!("IMG2 header too short"); }
+    let entry_count = u32::from_le_bytes(d[4..8].try_into().unwrap()) as usize;
+    let entries_start = 8usize;
+    let entries_size  = entry_count * 32;
+    if d.len() < entries_start + entries_size { bail!("IMG2 TOC truncated"); }
+    let entries = parse_img2_entries(&d[entries_start..entries_start + entries_size], entry_count)?;
+    Ok((entries, RpfEncryption::None))
+}
+
+fn parse_img2_entries(data: &[u8], count: usize) -> Result<Vec<RpfEntry>> {
+    let mut entries = Vec::with_capacity(count);
+    for i in 0..count {
+        let off = i * 32;
+        if off + 32 > data.len() { break; }
+        let chunk = &data[off..off + 32];
+        let sector_offset = u32::from_le_bytes(chunk[0..4].try_into().unwrap());
+        let stream_sectors = u16::from_le_bytes(chunk[4..6].try_into().unwrap()) as u32;
+        // chunk[6..8] = file_size field, always 0 (reserved for streaming)
+        let name = read_fixed_cstring(&chunk[8..32]);
+        let name_lower = name.to_lowercase();
+        entries.push(RpfEntry {
+            name,
+            name_lower,
+            kind: RpfEntryKind::BinaryFile {
+                file_offset      : sector_offset * 2048,
+                file_size        : 0,
+                uncompressed_size: stream_sectors * 2048,
+                is_encrypted     : false,
+            },
+        });
+    }
+    Ok(entries)
+}
+
 // ─── IMG3 TOC ────────────────────────────────────────────────────────────────
 
 fn parse_img3_toc(d: &[u8]) -> Result<(Vec<RpfEntry>, RpfEncryption)> {
@@ -1039,6 +1129,12 @@ fn parse_img3_entries(
 }
 
 // ─── Common helpers ───────────────────────────────────────────────────────────
+
+/// Read a null-terminated string from a fixed-size field (IMG1/2 entry names).
+fn read_fixed_cstring(data: &[u8]) -> String {
+    let end = data.iter().position(|&b| b == 0).unwrap_or(data.len());
+    String::from_utf8_lossy(&data[..end]).into_owned()
+}
 
 fn read_cstring(data: &[u8], offset: usize) -> Option<String> {
     if offset >= data.len() { return None; }

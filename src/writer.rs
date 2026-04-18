@@ -4,7 +4,7 @@ use anyhow::{bail, Result};
 
 use crate::archive::{
     RpfEncryption, RpfVersion,
-    IMG3_MAGIC, RPF0_MAGIC, RPF2_MAGIC, RPF3_MAGIC, RPF4_MAGIC, RPF6_MAGIC, RPF7_MAGIC, RSC7_MAGIC,
+    IMG2_MAGIC, IMG3_MAGIC, RPF0_MAGIC, RPF2_MAGIC, RPF3_MAGIC, RPF4_MAGIC, RPF6_MAGIC, RPF7_MAGIC, RSC7_MAGIC,
 };
 use crate::crypto::{encrypt_aes, GtaKeys};
 
@@ -77,7 +77,8 @@ impl RpfBuilder {
 
     /// Create a builder targeting any supported write format.
     ///
-    /// Supported versions: V0, V2, V3, V4, V6, V7, Img3.
+    /// Supported versions: V0, V2, V3, V4, V6, V7, Img2, Img3.
+    /// For Img1 use [`RpfBuilder::build_img1_pair`] instead of [`RpfBuilder::build`].
     /// V8 is not supported (requires proprietary TFIT keys and RSA signing).
     pub fn for_version(version: RpfVersion, encryption: RpfEncryption) -> Self {
         Self { version, encryption, root: BuildDir::new("") }
@@ -122,7 +123,9 @@ impl RpfBuilder {
             | RpfVersion::V3
             | RpfVersion::V4 => self.build_v2(),
             RpfVersion::V6   => self.build_v6(),
+            RpfVersion::Img2 => self.build_img2(),
             RpfVersion::Img3 => self.build_img3(),
+            RpfVersion::Img1 => bail!("IMG1 produces two files — use build_img1_pair() instead"),
             RpfVersion::V8   => bail!("RPF8 write not supported (requires TFIT keys + RSA signing)"),
         }
     }
@@ -569,6 +572,73 @@ impl RpfBuilder {
         Ok(out)
     }
 
+    // ─── IMG1 ─────────────────────────────────────────────────────────────────
+
+    /// Build an IMG v1 archive (GTA III / Vice City).
+    /// Returns `(dir_data, img_data)` — write them as `<name>.dir` and `<name>.img`.
+    pub fn build_img1_pair(self) -> Result<(Vec<u8>, Vec<u8>)> {
+        let mut flat_files: Vec<(String, Vec<u8>)> = Vec::new();
+        Self::collect_files_flat(&self.root, "", &mut flat_files);
+
+        let mut dir_out = Vec::<u8>::new();
+        let mut img_out = Vec::<u8>::new();
+        let mut current_sector: u32 = 0;
+
+        for (name, data) in &flat_files {
+            let size_sectors = ((data.len() + 2047) / 2048) as u32;
+            dir_out.extend_from_slice(&current_sector.to_le_bytes());
+            dir_out.extend_from_slice(&size_sectors.to_le_bytes());
+            dir_out.extend_from_slice(&name_to_fixed24(name));
+            img_out.extend_from_slice(data);
+            let pad = align_up(img_out.len(), 2048) - img_out.len();
+            img_out.resize(img_out.len() + pad, 0);
+            current_sector += size_sectors;
+        }
+
+        Ok((dir_out, img_out))
+    }
+
+    // ─── IMG2 ─────────────────────────────────────────────────────────────────
+
+    fn build_img2(self) -> Result<Vec<u8>> {
+        let mut flat_files: Vec<(String, Vec<u8>)> = Vec::new();
+        Self::collect_files_flat(&self.root, "", &mut flat_files);
+
+        let entry_count = flat_files.len();
+        let toc_bytes   = 8 + entry_count * 32;
+        let first_data_sector = (toc_bytes + 2047) / 2048;
+
+        // Compute per-file sector offsets
+        let mut sector_offsets: Vec<u32> = Vec::with_capacity(entry_count);
+        let mut current_sector = first_data_sector as u32;
+        for (_, data) in &flat_files {
+            sector_offsets.push(current_sector);
+            current_sector += ((data.len() + 2047) / 2048) as u32;
+        }
+
+        let mut out = Vec::new();
+        out.extend_from_slice(&IMG2_MAGIC.to_le_bytes());
+        out.extend_from_slice(&(entry_count as u32).to_le_bytes());
+
+        for (i, (name, data)) in flat_files.iter().enumerate() {
+            let stream_sectors = ((data.len() + 2047) / 2048) as u16;
+            out.extend_from_slice(&sector_offsets[i].to_le_bytes());
+            out.extend_from_slice(&stream_sectors.to_le_bytes());
+            out.extend_from_slice(&0u16.to_le_bytes()); // reserved
+            out.extend_from_slice(&name_to_fixed24(name));
+        }
+
+        out.resize(first_data_sector * 2048, 0);
+
+        for (_, data) in &flat_files {
+            out.extend_from_slice(data);
+            let pad = align_up(out.len(), 2048) - out.len();
+            out.resize(out.len() + pad, 0);
+        }
+
+        Ok(out)
+    }
+
     // ─── IMG3 ─────────────────────────────────────────────────────────────────
 
     fn build_img3(self) -> Result<Vec<u8>> {
@@ -724,6 +794,16 @@ impl RpfBuilder {
 }
 
 // ─── Utility helpers ──────────────────────────────────────────────────────────
+
+/// Write a filename into a 24-byte null-padded field (IMG1/2 entry name).
+/// Truncates to 23 characters, leaving room for the null terminator.
+fn name_to_fixed24(name: &str) -> [u8; 24] {
+    let mut buf = [0u8; 24];
+    let bytes = name.as_bytes();
+    let len = bytes.len().min(23);
+    buf[..len].copy_from_slice(&bytes[..len]);
+    buf
+}
 
 fn align_up(value: usize, align: usize) -> usize {
     (value + align - 1) & !(align - 1)
